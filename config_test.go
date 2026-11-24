@@ -9,6 +9,98 @@ import (
 	"go.yaml.in/yaml/v4"
 )
 
+func TestConfigParseReusableWorkflowsOK(t *testing.T) {
+	testCases := []struct {
+		what  string
+		input string
+		want  *ReusableWorkflowsConfig
+	}{
+		{
+			what:  "empty config",
+			input: "",
+			want:  nil,
+		},
+		{
+			what:  "empty reusable-workflows",
+			input: "reusable-workflows:",
+			want:  nil,
+		},
+		{
+			what:  "empty mapping",
+			input: "reusable-workflows: {}",
+			want:  &ReusableWorkflowsConfig{},
+		},
+		{
+			what:  "snapshots dir",
+			input: "reusable-workflows:\n  snapshots-dir: .github/actionlint-workflows",
+			want:  &ReusableWorkflowsConfig{SnapshotsDir: ".github/actionlint-workflows"},
+		},
+		{
+			what:  "strict mode",
+			input: "reusable-workflows:\n  snapshots-dir: .github/actionlint-workflows\n  strict: true",
+			want:  &ReusableWorkflowsConfig{SnapshotsDir: ".github/actionlint-workflows", Strict: true},
+		},
+		{
+			what:  "unknown keys are ignored for forward compatibility",
+			input: "reusable-workflows:\n  snapshots-dir: .github/actionlint-workflows\n  some-future-key: [1, 2]\nsome-other-future-key: foo",
+			want:  &ReusableWorkflowsConfig{SnapshotsDir: ".github/actionlint-workflows"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.what, func(t *testing.T) {
+			c, err := ParseConfig([]byte(tc.input))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(c.ReusableWorkflows, tc.want); diff != "" {
+				t.Fatal(diff)
+			}
+		})
+	}
+}
+
+func TestConfigParseReusableWorkflowsError(t *testing.T) {
+	tests := []struct {
+		what  string
+		input string
+		want  string
+	}{
+		{
+			what:  "absolute path",
+			input: "reusable-workflows:\n  snapshots-dir: /tmp/snapshots",
+			want:  `invalid directory "/tmp/snapshots" in "reusable-workflows.snapshots-dir"`,
+		},
+		{
+			what:  "escaping repository root",
+			input: "reusable-workflows:\n  snapshots-dir: ../snapshots",
+			want:  `invalid directory "../snapshots" in "reusable-workflows.snapshots-dir"`,
+		},
+		{
+			what:  "escaping repository root via nested path",
+			input: "reusable-workflows:\n  snapshots-dir: .github/../../snapshots",
+			want:  `invalid directory ".github/../../snapshots" in "reusable-workflows.snapshots-dir"`,
+		},
+		{
+			what:  "wrong type",
+			input: "reusable-workflows: 42",
+			want:  `cannot unmarshal`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.what, func(t *testing.T) {
+			_, err := ParseConfig([]byte(tc.input))
+			if err == nil {
+				t.Fatal("no error occurred")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("wanted error message %q to contain %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
 func TestConfigParseSelfHostedRunnerOK(t *testing.T) {
 	testCases := []struct {
 		what   string

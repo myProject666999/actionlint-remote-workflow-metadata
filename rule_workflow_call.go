@@ -58,6 +58,7 @@ func (rule *RuleWorkflowCall) VisitJobPre(n *Job) error {
 	}
 
 	if isWorkflowCallUsesRepoFormat(u.Value) {
+		rule.checkWorkflowCallUsesRemote(n.WorkflowCall)
 		return nil
 	}
 
@@ -88,11 +89,39 @@ func (rule *RuleWorkflowCall) checkWorkflowCallUsesLocal(call *WorkflowCall) {
 		return
 	}
 
+	rule.checkWorkflowCallWithMetadata(call, m, "")
+}
+
+// checkWorkflowCallUsesRemote checks a remote reusable workflow call
+// "owner/repo/path/to/workflow.yml@ref" against a local snapshot of the remote workflow file.
+// When no snapshot is configured or found for the call, the check is silently skipped unless
+// the strict mode is enabled (in the case, FindMetadata returns an error).
+func (rule *RuleWorkflowCall) checkWorkflowCallUsesRemote(call *WorkflowCall) {
+	u := call.Uses
+	m, err := rule.cache.FindMetadata(u.Value)
+	if err != nil {
+		rule.Error(u.Pos, err.Error())
+		return
+	}
+	if m == nil {
+		rule.Debug("Skip remote workflow call %q since no snapshot was found", u.Value)
+		return
+	}
+
+	rule.checkWorkflowCallWithMetadata(call, m, rule.cache.snapshotNote(u.Value))
+}
+
+// checkWorkflowCallWithMetadata checks inputs and secrets of the workflow call against the
+// metadata of the called reusable workflow. The 'srcNote' is appended to each error message. It
+// is used for telling that the metadata was resolved from a local snapshot of a remote workflow.
+func (rule *RuleWorkflowCall) checkWorkflowCallWithMetadata(call *WorkflowCall, m *ReusableWorkflowMetadata, srcNote string) {
+	u := call.Uses
+
 	// Validate inputs
 	for n, i := range m.Inputs {
 		if i != nil && i.Required {
 			if _, ok := call.Inputs[n]; !ok {
-				rule.Errorf(u.Pos, "input %q is required by %q reusable workflow", i.Name, u.Value)
+				rule.Errorf(u.Pos, "input %q is required by %q reusable workflow%s", i.Name, u.Value, srcNote)
 			}
 		}
 	}
@@ -110,7 +139,7 @@ func (rule *RuleWorkflowCall) checkWorkflowCallUsesLocal(call *WorkflowCall) {
 					note = "defined inputs are " + sortedQuotes(is)
 				}
 			}
-			rule.Errorf(i.Name.Pos, "input %q is not defined in %q reusable workflow. %s", i.Name.Value, u.Value, note)
+			rule.Errorf(i.Name.Pos, "input %q is not defined in %q reusable workflow. %s%s", i.Name.Value, u.Value, note, srcNote)
 		}
 	}
 
@@ -119,7 +148,7 @@ func (rule *RuleWorkflowCall) checkWorkflowCallUsesLocal(call *WorkflowCall) {
 		for n, s := range m.Secrets {
 			if s.Required {
 				if _, ok := call.Secrets[n]; !ok {
-					rule.Errorf(u.Pos, "secret %q is required by %q reusable workflow", s.Name, u.Value)
+					rule.Errorf(u.Pos, "secret %q is required by %q reusable workflow%s", s.Name, u.Value, srcNote)
 				}
 			}
 		}
@@ -137,7 +166,7 @@ func (rule *RuleWorkflowCall) checkWorkflowCallUsesLocal(call *WorkflowCall) {
 						note = "defined secrets are " + sortedQuotes(ss)
 					}
 				}
-				rule.Errorf(s.Name.Pos, "secret %q is not defined in %q reusable workflow. %s", s.Name.Value, u.Value, note)
+				rule.Errorf(s.Name.Pos, "secret %q is not defined in %q reusable workflow. %s%s", s.Name.Value, u.Value, note, srcNote)
 			}
 		}
 	}

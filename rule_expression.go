@@ -572,11 +572,12 @@ func (rule *RuleExpression) checkWorkflowCall(c *WorkflowCall) {
 		if !mi.Type.Assignable(ty) {
 			rule.Errorf(
 				i.Value.Pos,
-				"input %q is typed as %s by reusable workflow %q. %s value cannot be assigned",
+				"input %q is typed as %s by reusable workflow %q. %s value cannot be assigned%s",
 				mi.Name,
 				mi.Type.String(),
 				c.Uses.Value,
 				ty.String(),
+				rule.localWorkflows.snapshotNote(c.Uses.Value),
 			)
 		}
 	}

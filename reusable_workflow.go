@@ -1,6 +1,7 @@
 package actionlint
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -172,6 +173,7 @@ type LocalReusableWorkflowCache struct {
 	cache map[string]*ReusableWorkflowMetadata
 	cwd   string
 	dbg   io.Writer
+	cfg   *Config // maybe nil
 }
 
 func (c *LocalReusableWorkflowCache) debug(format string, args ...interface{}) {
@@ -195,8 +197,109 @@ func (c *LocalReusableWorkflowCache) writeCache(key string, val *ReusableWorkflo
 	c.mu.Unlock()
 }
 
+// SetConfig sets an effective configuration to the cache. The configuration is used for resolving
+// snapshots of remote reusable workflow files. When this method is never called or nil is set,
+// the configuration of the project is used instead. Calling this method is thread-safe.
+func (c *LocalReusableWorkflowCache) SetConfig(cfg *Config) {
+	c.mu.Lock()
+	c.cfg = cfg
+	c.mu.Unlock()
+}
+
+func (c *LocalReusableWorkflowCache) getConfig() *Config {
+	c.mu.RLock()
+	cfg := c.cfg
+	c.mu.RUnlock()
+	if cfg != nil {
+		return cfg
+	}
+	if c.proj != nil {
+		return c.proj.Config()
+	}
+	return nil
+}
+
+// parseRemoteWorkflowCallSpec parses a remote reusable workflow call spec
+// "owner/repo/path/to/workflow.yml@ref" into its components. The ref is separated from the
+// workflow path at the first "@" following the same rule as isWorkflowCallUsesRepoFormat.
+func parseRemoteWorkflowCallSpec(spec string) (owner, repo, wpath, ref string, ok bool) {
+	if strings.HasPrefix(spec, ".") || strings.HasPrefix(spec, "/") {
+		return "", "", "", "", false
+	}
+
+	i := strings.IndexRune(spec, '/')
+	if i <= 0 {
+		return "", "", "", "", false
+	}
+	owner, rest := spec[:i], spec[i+1:]
+
+	i = strings.IndexRune(rest, '/')
+	if i <= 0 {
+		return "", "", "", "", false
+	}
+	repo, rest = rest[:i], rest[i+1:]
+
+	i = strings.IndexRune(rest, '@')
+	if i <= 0 || i == len(rest)-1 {
+		return "", "", "", "", false
+	}
+	wpath, ref = rest[:i], rest[i+1:]
+
+	return owner, repo, wpath, ref, true
+}
+
+// snapshotFilePath resolves a file path of the snapshot for the given remote reusable workflow
+// call spec such as "owner/repo/path/to/workflow.yml@ref". The second return value is false when
+// no snapshots directory is configured, the spec is not a remote workflow call, or the resolved
+// path escapes the snapshots directory.
+func (c *LocalReusableWorkflowCache) snapshotFilePath(spec string) (string, bool) {
+	cfg := c.getConfig()
+	if c.proj == nil || cfg == nil || cfg.ReusableWorkflows == nil || cfg.ReusableWorkflows.SnapshotsDir == "" {
+		return "", false
+	}
+
+	owner, repo, wpath, ref, ok := parseRemoteWorkflowCallSpec(spec)
+	if !ok {
+		return "", false
+	}
+
+	// GitHub treats owner and repository names case-insensitively so they are normalized to
+	// lower case. On the other hand, the workflow path and the ref are case-sensitive so they
+	// are used as-is. The ref is matched exactly; a snapshot for "@v1" is never used for a call
+	// with "@v1.2.3".
+	owner = strings.ToLower(owner)
+	repo = strings.ToLower(repo)
+
+	base := filepath.Join(c.proj.RootDir(), filepath.FromSlash(cfg.ReusableWorkflows.SnapshotsDir))
+	// Note: filepath.Join cleans the result so ".." path elements in the workflow path could
+	// escape the snapshots directory. Such paths are rejected by the check below.
+	p := filepath.Join(base, owner, repo, filepath.FromSlash(wpath)+"@"+ref)
+	if !strings.HasPrefix(p, base+string(os.PathSeparator)) {
+		c.debug("Snapshot path %q for %q is out of the snapshots directory %q", p, spec, base)
+		return "", false
+	}
+	return p, true
+}
+
+// snapshotNote returns a message suffix which tells that the metadata was resolved from a local
+// snapshot file. It returns an empty string when the spec is not a remote reusable workflow call
+// or no snapshots directory is configured.
+func (c *LocalReusableWorkflowCache) snapshotNote(spec string) string {
+	if p, ok := c.snapshotFilePath(spec); ok {
+		return fmt.Sprintf(". the metadata was read from snapshot %q", p)
+	}
+	return ""
+}
+
 // FindMetadata finds/parses a reusable workflow metadata located by the 'spec' argument. When project
-// is not set to 'proj' field or the spec does not start with "./", this method immediately returns with nil.
+// is not set to 'proj' field, this method immediately returns with nil.
+//
+// When the spec starts with "./", the metadata is read from the local reusable workflow file in
+// the project. Otherwise the spec is considered a remote workflow call
+// "owner/repo/path/to/workflow.yml@ref" and the metadata is read from a local snapshot of the
+// remote workflow file when a snapshots directory is configured with the "reusable-workflows"
+// configuration. When no snapshot is found for the remote call, this method returns with nil
+// (or an error when the strict mode is enabled) so that the call is skipped as before.
 //
 // Note that an error is not cached. At first search, let's say this method returned an error since
 // the reusable workflow is invalid. In this case, calling this method with the same spec later will
@@ -205,7 +308,7 @@ func (c *LocalReusableWorkflowCache) writeCache(key string, val *ReusableWorkflo
 //
 // Calling this method is thread-safe.
 func (c *LocalReusableWorkflowCache) FindMetadata(spec string) (*ReusableWorkflowMetadata, error) {
-	if c.proj == nil || !strings.HasPrefix(spec, "./") || ContainsExpression(spec) {
+	if c.proj == nil || ContainsExpression(spec) {
 		return nil, nil
 	}
 
@@ -214,6 +317,13 @@ func (c *LocalReusableWorkflowCache) FindMetadata(spec string) (*ReusableWorkflo
 		return m, nil
 	}
 
+	if strings.HasPrefix(spec, "./") {
+		return c.findLocalMetadata(spec)
+	}
+	return c.findRemoteSnapshotMetadata(spec)
+}
+
+func (c *LocalReusableWorkflowCache) findLocalMetadata(spec string) (*ReusableWorkflowMetadata, error) {
 	file := filepath.Join(c.proj.RootDir(), filepath.FromSlash(spec))
 	src, err := os.ReadFile(file)
 	if err != nil {
@@ -229,6 +339,59 @@ func (c *LocalReusableWorkflowCache) FindMetadata(spec string) (*ReusableWorkflo
 	}
 
 	c.debug("New reusable workflow metadata at %s: %v", file, m)
+	c.writeCache(spec, m)
+	return m, nil
+}
+
+func (c *LocalReusableWorkflowCache) findRemoteSnapshotMetadata(spec string) (*ReusableWorkflowMetadata, error) {
+	file, ok := c.snapshotFilePath(spec)
+	if !ok {
+		return nil, nil
+	}
+
+	st, err := os.Lstat(file)
+	if err != nil {
+		c.writeCache(spec, nil) // Remember the snapshot was not found
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("could not read snapshot %q for remote reusable workflow %q: %w", file, spec, err)
+		}
+		if cfg := c.getConfig(); cfg != nil && cfg.ReusableWorkflows != nil && cfg.ReusableWorkflows.Strict {
+			return nil, fmt.Errorf(
+				"no snapshot was found for remote reusable workflow %q. save the workflow file of the remote repository as %q to check this call. see https://github.com/rhysd/actionlint/blob/main/docs/config.md for more details",
+				spec,
+				file,
+			)
+		}
+		// By default, remote workflow calls with no snapshot are silently skipped
+		return nil, nil
+	}
+	if st.Mode()&os.ModeSymlink != 0 {
+		c.writeCache(spec, nil) // Remember the snapshot was invalid
+		return nil, fmt.Errorf(
+			"snapshot %q for remote reusable workflow %q is a symbolic link. snapshot files must be regular files since snapshots are untrusted data",
+			file,
+			spec,
+		)
+	}
+	if !st.Mode().IsRegular() {
+		c.writeCache(spec, nil) // Remember the snapshot was invalid
+		return nil, fmt.Errorf("snapshot %q for remote reusable workflow %q is not a regular file", file, spec)
+	}
+
+	src, err := os.ReadFile(file)
+	if err != nil {
+		c.writeCache(spec, nil) // Remember the snapshot was not readable
+		return nil, fmt.Errorf("could not read snapshot %q for remote reusable workflow %q: %w", file, spec, err)
+	}
+
+	m, err := parseReusableWorkflowMetadata(src)
+	if err != nil {
+		c.writeCache(spec, nil) // Remember the snapshot was invalid
+		msg := strings.ReplaceAll(err.Error(), "\n", " ")
+		return nil, fmt.Errorf("error while parsing snapshot %q for remote reusable workflow %q: %s", file, spec, msg)
+	}
+
+	c.debug("New reusable workflow metadata from snapshot %s: %v", file, m)
 	c.writeCache(spec, m)
 	return m, nil
 }

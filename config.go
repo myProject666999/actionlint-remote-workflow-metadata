@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -43,6 +44,24 @@ func (pats *IgnorePatterns) UnmarshalYAML(n *yaml.Node) error {
 	return nil
 }
 
+// ReusableWorkflowsConfig is a configuration for checking remote reusable workflow calls
+// ("owner/repo/path/to/workflow.yml@ref") against local snapshots of the remote workflow files.
+// This is for the "reusable-workflows" mapping in the configuration file.
+type ReusableWorkflowsConfig struct {
+	// SnapshotsDir is a directory path relative to the repository root directory. The directory
+	// contains snapshots of remote reusable workflow files. A snapshot for a workflow call
+	// "owner/repo/path/to/workflow.yml@ref" must be stored at
+	// "<snapshots-dir>/<owner>/<repo>/<path/to/workflow.yml>@<ref>". The owner and repository
+	// names are compared case-insensitively so they must be stored in lower case. The workflow
+	// path and the ref are case-sensitive and the ref is matched exactly ("@v1" does not match
+	// "@v1.2.3"). When this value is empty, remote reusable workflow calls are not checked.
+	SnapshotsDir string `yaml:"snapshots-dir"`
+	// Strict is a flag to report remote reusable workflow calls which have no corresponding
+	// snapshot in the snapshots directory. When this value is false (default), such calls are
+	// silently skipped. This flag has no effect when "snapshots-dir" is not set.
+	Strict bool `yaml:"strict"`
+}
+
 // PathConfig is a configuration for specific file path pattern. This is for values of the "paths" mapping
 // in the configuration file.
 type PathConfig struct {
@@ -67,6 +86,9 @@ type Config struct {
 	// Paths is a "paths" mapping in the configuration file. The keys are glob patterns to match file paths.
 	// And the values are corresponding configurations applied to the file paths.
 	Paths map[string]PathConfig `yaml:"paths"`
+	// ReusableWorkflows is a "reusable-workflows" configuration in the configuration file. It configures
+	// how remote reusable workflow calls are checked against local snapshots of the remote workflow files.
+	ReusableWorkflows *ReusableWorkflowsConfig `yaml:"reusable-workflows"`
 }
 
 // PathConfigs returns a list of all PathConfig values matching to the given file path. The path must
@@ -97,6 +119,21 @@ func ParseConfig(b []byte) (*Config, error) {
 	for pat := range c.Paths {
 		if !doublestar.ValidatePattern(pat) {
 			return nil, fmt.Errorf("invalid glob pattern %q in \"paths\"", pat)
+		}
+	}
+	if r := c.ReusableWorkflows; r != nil && r.SnapshotsDir != "" {
+		d := r.SnapshotsDir
+		if filepath.IsAbs(d) || path.IsAbs(d) {
+			return nil, fmt.Errorf(
+				"invalid directory %q in \"reusable-workflows.snapshots-dir\": the snapshots directory must be a relative path from the repository root directory",
+				d,
+			)
+		}
+		if cl := filepath.Clean(filepath.FromSlash(d)); cl == ".." || strings.HasPrefix(cl, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf(
+				"invalid directory %q in \"reusable-workflows.snapshots-dir\": the snapshots directory must be inside the repository root directory",
+				d,
+			)
 		}
 	}
 	return &c, nil
@@ -153,6 +190,20 @@ config-variables: null
 paths:
 #  .github/workflows/**/*.yml:
 #    ignore: []
+
+# Configuration for checking remote reusable workflow calls against local
+# snapshots of the remote workflow files. See
+# https://github.com/rhysd/actionlint/blob/main/docs/config.md for the details.
+#
+#reusable-workflows:
+#  # Directory which contains snapshots of remote reusable workflow files,
+#  # relative to the repository root. A snapshot for a workflow call
+#  # "owner/repo/path/to/workflow.yml@ref" is stored at
+#  # "<snapshots-dir>/<owner>/<repo>/<path/to/workflow.yml>@<ref>".
+#  snapshots-dir: .github/actionlint-workflows
+#  # Report remote reusable workflow calls which have no corresponding
+#  # snapshot. The default is false (such calls are silently skipped).
+#  strict: false
 `)
 	if err := os.WriteFile(path, b, 0644); err != nil {
 		return fmt.Errorf("could not write default configuration file at %q: %w", path, err)

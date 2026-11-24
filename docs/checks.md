@@ -2171,6 +2171,11 @@ actionlint does several checks for both workflow calls (caller) and reusable wor
 
 These checks are described in this section.
 
+Note that the checks for workflow calls work for local reusable workflows (`./path/to/workflow.yml`) by default.
+Remote reusable workflow calls (`owner/repo/path/to/workflow.yml@ref`) are skipped since actionlint never fetches
+anything from the network. To check the remote calls as well, put snapshots of the remote workflow files in your
+repository and configure [`reusable-workflows.snapshots-dir`](config.md#remote-workflow-snapshots).
+
 ### Check input definitions of `workflow_call` event in reusable workflow
 
 Example input:

@@ -3,8 +3,11 @@ package actionlint
 import (
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -918,5 +921,703 @@ func TestReusableWorkflowCacheFactory(t *testing.T) {
 	c4 := f.GetCache(nil)
 	if c4.proj != nil {
 		t.Errorf("Null cache should be returned when project is nil: %v", c4)
+	}
+}
+
+func testWriteSnapshotFile(t *testing.T, path string, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const testRemoteSnapshotContent = `
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      retries:
+        type: number
+    secrets:
+      token:
+        required: true
+    outputs:
+      version:
+        value: ${{ jobs.build.outputs.version }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.value }}
+    steps:
+      - id: v
+        run: echo "value=1.0.0" >> "$GITHUB_OUTPUT"
+`
+
+var testRemoteSnapshotWantedMetadata *ReusableWorkflowMetadata = &ReusableWorkflowMetadata{
+	Inputs: ReusableWorkflowMetadataInputs{
+		"version": {"version", true, StringType{}},
+		"retries": {"retries", false, NumberType{}},
+	},
+	Outputs: ReusableWorkflowMetadataOutputs{
+		"version": {"version"},
+	},
+	Secrets: ReusableWorkflowMetadataSecrets{
+		"token": {"token", true},
+	},
+}
+
+func testRemoteSnapshotProject(t *testing.T, strict bool) (string, *Project) {
+	t.Helper()
+	root := t.TempDir()
+	p := filepath.Join(
+		root, ".github", "actionlint-workflows",
+		"octo-org", "shared-workflows", ".github", "workflows", "build.yml@v1",
+	)
+	testWriteSnapshotFile(t, p, testRemoteSnapshotContent)
+	cfg := &Config{
+		ReusableWorkflows: &ReusableWorkflowsConfig{
+			SnapshotsDir: ".github/actionlint-workflows",
+			Strict:       strict,
+		},
+	}
+	return root, &Project{root, cfg}
+}
+
+func TestReusableWorkflowRemoteSnapshotFindMetadataOK(t *testing.T) {
+	_, proj := testRemoteSnapshotProject(t, false)
+	c := NewLocalReusableWorkflowCache(proj, "", nil)
+
+	spec := "octo-org/shared-workflows/.github/workflows/build.yml@v1"
+	m, err := c.FindMetadata(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(m, testRemoteSnapshotWantedMetadata); diff != "" {
+		t.Fatal(diff)
+	}
+
+	// The metadata must be cached
+	m2, err := c.FindMetadata(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m != m2 {
+		t.Error("metadata is not cached")
+	}
+}
+
+func TestReusableWorkflowRemoteSnapshotOwnerRepoCaseInsensitive(t *testing.T) {
+	_, proj := testRemoteSnapshotProject(t, false)
+	c := NewLocalReusableWorkflowCache(proj, "", nil)
+
+	// Owner and repository names are case-insensitive. The snapshot directory is stored in
+	// lower case so upper-case names in the spec must be normalized.
+	m, err := c.FindMetadata("Octo-Org/SHARED-Workflows/.github/workflows/build.yml@v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(m, testRemoteSnapshotWantedMetadata); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+func TestReusableWorkflowRemoteSnapshotSkip(t *testing.T) {
+	_, proj := testRemoteSnapshotProject(t, false)
+
+	tests := []struct {
+		what string
+		spec string
+	}{
+		{
+			what: "ref does not match exactly",
+			spec: "octo-org/shared-workflows/.github/workflows/build.yml@v1.2.3",
+		},
+		{
+			what: "workflow path does not exist",
+			spec: "octo-org/shared-workflows/.github/workflows/other.yml@v1",
+		},
+		{
+			what: "repository does not exist",
+			spec: "octo-org/another-repo/.github/workflows/build.yml@v1",
+		},
+		{
+			what: "path traversal in workflow path",
+			spec: "octo-org/shared-workflows/../../escape.yml@v1",
+		},
+		{
+			what: "path traversal in owner",
+			spec: "../octo-org/shared-workflows/.github/workflows/build.yml@v1",
+		},
+		{
+			what: "no ref",
+			spec: "octo-org/shared-workflows/.github/workflows/build.yml",
+		},
+		{
+			what: "empty ref",
+			spec: "octo-org/shared-workflows/.github/workflows/build.yml@",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.what, func(t *testing.T) {
+			c := NewLocalReusableWorkflowCache(proj, "", nil)
+			m, err := c.FindMetadata(tc.spec)
+			if err != nil {
+				t.Fatal("remote workflow call with no snapshot must be silently skipped by default:", err)
+			}
+			if m != nil {
+				t.Fatal("metadata should be nil:", m)
+			}
+			// The miss must be cached
+			m, err = c.FindMetadata(tc.spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m != nil {
+				t.Fatal("nil is not cached:", m)
+			}
+		})
+	}
+}
+
+func TestReusableWorkflowRemoteSnapshotNoSnapshotsDir(t *testing.T) {
+	root := t.TempDir()
+	proj := &Project{root, nil}
+	c := NewLocalReusableWorkflowCache(proj, "", nil)
+	m, err := c.FindMetadata("octo-org/shared-workflows/.github/workflows/build.yml@v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m != nil {
+		t.Fatal("metadata should be nil when no config exists:", m)
+	}
+
+	cfg := &Config{ReusableWorkflows: &ReusableWorkflowsConfig{}}
+	proj = &Project{root, cfg}
+	c = NewLocalReusableWorkflowCache(proj, "", nil)
+	m, err = c.FindMetadata("octo-org/shared-workflows/.github/workflows/build.yml@v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m != nil {
+		t.Fatal("metadata should be nil when no snapshots directory is configured:", m)
+	}
+}
+
+func TestReusableWorkflowRemoteSnapshotStrictMode(t *testing.T) {
+	root, proj := testRemoteSnapshotProject(t, true)
+	c := NewLocalReusableWorkflowCache(proj, "", nil)
+
+	spec := "octo-org/shared-workflows/.github/workflows/other.yml@v1"
+	_, err := c.FindMetadata(spec)
+	if err == nil {
+		t.Fatal("error did not occur in strict mode")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "no snapshot was found for remote reusable workflow") {
+		t.Fatal("unexpected error message:", msg)
+	}
+	if !strings.Contains(msg, spec) {
+		t.Fatal("error message does not contain the spec:", msg)
+	}
+	wantPath := filepath.Join(
+		root, ".github", "actionlint-workflows",
+		"octo-org", "shared-workflows", ".github", "workflows", "other.yml@v1",
+	)
+	if !strings.Contains(msg, wantPath) {
+		t.Fatalf("error message does not contain the snapshot path %q: %s", wantPath, msg)
+	}
+
+	// The error must not be repeated
+	m, err := c.FindMetadata(spec)
+	if err != nil {
+		t.Fatal("error happens when finding metadata again:", err)
+	}
+	if m != nil {
+		t.Fatal("nil is not cached:", m)
+	}
+
+	// Existing snapshots are checked even in strict mode
+	m, err = c.FindMetadata("octo-org/shared-workflows/.github/workflows/build.yml@v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(m, testRemoteSnapshotWantedMetadata); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+func TestReusableWorkflowRemoteSnapshotInvalidSnapshots(t *testing.T) {
+	tests := []struct {
+		what    string
+		content string
+		want    string
+	}{
+		{
+			what:    "broken yaml",
+			content: "on: [workflow_call",
+			want:    "error while parsing snapshot",
+		},
+		{
+			what:    "not a reusable workflow",
+			content: "on: push\n",
+			want:    "\"workflow_call\" event trigger is not found",
+		},
+		{
+			what:    "no on",
+			content: "jobs: {}\n",
+			want:    "\"on:\" is not found",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.what, func(t *testing.T) {
+			root, proj := testRemoteSnapshotProject(t, false)
+			p := filepath.Join(
+				root, ".github", "actionlint-workflows",
+				"octo-org", "shared-workflows", ".github", "workflows", "broken.yml@v1",
+			)
+			testWriteSnapshotFile(t, p, tc.content)
+
+			c := NewLocalReusableWorkflowCache(proj, "", nil)
+			spec := "octo-org/shared-workflows/.github/workflows/broken.yml@v1"
+			_, err := c.FindMetadata(spec)
+			if err == nil {
+				t.Fatal("error did not occur")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.want) {
+				t.Fatalf("error message %q does not contain %q", msg, tc.want)
+			}
+			if !strings.Contains(msg, p) {
+				t.Fatalf("error message %q does not contain the snapshot path %q", msg, p)
+			}
+
+			// The error must not be repeated
+			m, err := c.FindMetadata(spec)
+			if err != nil {
+				t.Fatal("error happens when finding metadata again:", err)
+			}
+			if m != nil {
+				t.Fatal("nil is not cached:", m)
+			}
+		})
+	}
+}
+
+func TestReusableWorkflowRemoteSnapshotSymlink(t *testing.T) {
+	root, proj := testRemoteSnapshotProject(t, false)
+
+	// Create a symlink as a snapshot file. It points to a valid workflow file outside the
+	// snapshots directory, but it must be rejected since snapshots are untrusted data.
+	outside := filepath.Join(root, "outside.yml")
+	testWriteSnapshotFile(t, outside, testRemoteSnapshotContent)
+	link := filepath.Join(
+		root, ".github", "actionlint-workflows",
+		"octo-org", "shared-workflows", ".github", "workflows", "linked.yml@v1",
+	)
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skip("cannot create a symbolic link on this platform:", err)
+	}
+
+	c := NewLocalReusableWorkflowCache(proj, "", nil)
+	spec := "octo-org/shared-workflows/.github/workflows/linked.yml@v1"
+	_, err := c.FindMetadata(spec)
+	if err == nil {
+		t.Fatal("error did not occur for a symbolic link snapshot")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "symbolic link") {
+		t.Fatal("unexpected error message:", msg)
+	}
+	if !strings.Contains(msg, link) {
+		t.Fatalf("error message %q does not contain the snapshot path %q", msg, link)
+	}
+}
+
+func TestReusableWorkflowRemoteSnapshotReadOnce(t *testing.T) {
+	_, proj := testRemoteSnapshotProject(t, false)
+	var dbg strings.Builder
+	c := NewLocalReusableWorkflowCache(proj, "", &dbg)
+
+	spec := "octo-org/shared-workflows/.github/workflows/build.yml@v1"
+	// Multiple callers may reference the same remote workflow. The snapshot must be read
+	// and parsed only once.
+	for i := 0; i < 3; i++ {
+		m, err := c.FindMetadata(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m == nil {
+			t.Fatal("metadata was not found")
+		}
+	}
+
+	n := strings.Count(dbg.String(), "New reusable workflow metadata from snapshot")
+	if n != 1 {
+		t.Fatalf("snapshot was read %d times. debug output:\n%s", n, dbg.String())
+	}
+	if len(c.cache) != 1 {
+		t.Fatalf("unexpected %d caches are stored: %v", len(c.cache), c.cache)
+	}
+}
+
+func TestReusableWorkflowRemoteSnapshotSetConfig(t *testing.T) {
+	root, proj := testRemoteSnapshotProject(t, false)
+	// The project has no config. The config is set via SetConfig instead.
+	proj = &Project{root, nil}
+	c := NewLocalReusableWorkflowCache(proj, "", nil)
+
+	m, err := c.FindMetadata("octo-org/shared-workflows/.github/workflows/build.yml@v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m != nil {
+		t.Fatal("metadata should be nil before SetConfig:", m)
+	}
+
+	c.SetConfig(&Config{
+		ReusableWorkflows: &ReusableWorkflowsConfig{
+			SnapshotsDir: ".github/actionlint-workflows",
+		},
+	})
+
+	m, err = c.FindMetadata("octo-org/shared-workflows/.github/workflows/build.yml@v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(m, testRemoteSnapshotWantedMetadata); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+type testSyncWriter struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (w *testSyncWriter) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(b)
+}
+
+func (w *testSyncWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// testRemoteSnapshotLintProject creates a project in a temporary directory which contains the
+// caller workflow files, the config file, and the snapshot of the remote reusable workflow.
+// It returns the project root directory and the paths to the caller workflow files.
+func testRemoteSnapshotLintProject(t *testing.T, strict bool, callers map[string]string) (string, []string) {
+	t.Helper()
+
+	root := t.TempDir()
+	testEnsureDotGitDir(root)
+
+	cfg := "reusable-workflows:\n  snapshots-dir: .github/actionlint-workflows\n"
+	if strict {
+		cfg += "  strict: true\n"
+	}
+	testWriteSnapshotFile(t, filepath.Join(root, ".github", "actionlint.yaml"), cfg)
+
+	testWriteSnapshotFile(
+		t,
+		filepath.Join(root, ".github", "actionlint-workflows",
+			"octo-org", "shared-workflows", ".github", "workflows", "build.yml@v1"),
+		testRemoteSnapshotContent,
+	)
+
+	files := make([]string, 0, len(callers))
+	for name, content := range callers {
+		p := filepath.Join(root, ".github", "workflows", name)
+		testWriteSnapshotFile(t, p, content)
+		files = append(files, p)
+	}
+	sort.Strings(files)
+
+	return root, files
+}
+
+func TestReusableWorkflowRemoteSnapshotLint(t *testing.T) {
+	header := `
+on: push
+
+jobs:
+  call:
+    uses: octo-org/shared-workflows/.github/workflows/build.yml@v1
+`
+	footer := `
+  use:
+    needs: call
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ needs.call.outputs.version }}"
+`
+	validWith := `    with:
+      version: 1.0.0
+      retries: 3
+`
+	validSecrets := `    secrets:
+      token: ${{ secrets.MY_TOKEN }}
+`
+
+	tests := []struct {
+		what   string
+		strict bool
+		caller string
+		want   []string
+	}{
+		{
+			what:   "valid call",
+			caller: header + validWith + validSecrets + footer,
+			want:   []string{},
+		},
+		{
+			what: "required input is missing",
+			caller: header + `    with:
+      retries: 3
+` + validSecrets,
+			want: []string{
+				`input "version" is required by "octo-org/shared-workflows/.github/workflows/build.yml@v1" reusable workflow. the metadata was read from snapshot "`,
+			},
+		},
+		{
+			what: "undefined input",
+			caller: header + validWith + `      unknown: foo
+` + validSecrets,
+			want: []string{
+				`input "unknown" is not defined in "octo-org/shared-workflows/.github/workflows/build.yml@v1" reusable workflow. defined inputs are "retries", "version". the metadata was read from snapshot "`,
+			},
+		},
+		{
+			what: "input literal type mismatch",
+			caller: header + `    with:
+      version: 1.0.0
+      retries: foo
+` + validSecrets,
+			want: []string{
+				`input "retries" is typed as number by reusable workflow "octo-org/shared-workflows/.github/workflows/build.yml@v1". string value cannot be assigned. the metadata was read from snapshot "`,
+			},
+		},
+		{
+			what:   "required secret is missing",
+			caller: header + validWith,
+			want: []string{
+				`secret "token" is required by "octo-org/shared-workflows/.github/workflows/build.yml@v1" reusable workflow. the metadata was read from snapshot "`,
+			},
+		},
+		{
+			what: "inherit secrets",
+			caller: header + validWith + `    secrets: inherit
+`,
+			want: []string{},
+		},
+		{
+			what: "undefined output",
+			caller: header + validWith + validSecrets + `
+  use:
+    needs: call
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ needs.call.outputs.verison }}"
+`,
+			want: []string{
+				`property "verison" is not defined in object type {version: string}`,
+			},
+		},
+		{
+			what: "no snapshot is silently skipped by default",
+			caller: `
+on: push
+
+jobs:
+  call:
+    uses: octo-org/shared-workflows/.github/workflows/no-snapshot.yml@v1
+`,
+			want: []string{},
+		},
+		{
+			what:   "no snapshot is reported in strict mode",
+			strict: true,
+			caller: `
+on: push
+
+jobs:
+  call:
+    uses: octo-org/shared-workflows/.github/workflows/no-snapshot.yml@v1
+`,
+			want: []string{
+				`no snapshot was found for remote reusable workflow "octo-org/shared-workflows/.github/workflows/no-snapshot.yml@v1"`,
+			},
+		},
+		{
+			what:   "ref does not match exactly",
+			strict: true,
+			caller: `
+on: push
+
+jobs:
+  call:
+    uses: octo-org/shared-workflows/.github/workflows/build.yml@v1.2.3
+`,
+			want: []string{
+				`no snapshot was found for remote reusable workflow "octo-org/shared-workflows/.github/workflows/build.yml@v1.2.3"`,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.what, func(t *testing.T) {
+			_, files := testRemoteSnapshotLintProject(t, tc.strict, map[string]string{
+				"caller.yaml": tc.caller,
+			})
+
+			linter, err := NewLinter(io.Discard, &LinterOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			errs, err := linter.LintFiles(files, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(errs) != len(tc.want) {
+				t.Fatalf("wanted %d error(s) but got %d error(s): %v", len(tc.want), len(errs), errs)
+			}
+			for i, want := range tc.want {
+				if msg := errs[i].Error(); !strings.Contains(msg, want) {
+					t.Fatalf("error %q does not contain %q", msg, want)
+				}
+			}
+		})
+	}
+}
+
+func TestReusableWorkflowRemoteSnapshotLintReadOnce(t *testing.T) {
+	// Two caller jobs reference the same remote workflow
+	caller := `
+on: push
+
+jobs:
+  call1:
+    uses: octo-org/shared-workflows/.github/workflows/build.yml@v1
+    with:
+      version: 1.0.0
+    secrets:
+      token: ${{ secrets.MY_TOKEN }}
+  call2:
+    uses: octo-org/shared-workflows/.github/workflows/build.yml@v1
+    with:
+      version: 2.0.0
+    secrets:
+      token: ${{ secrets.MY_TOKEN }}
+`
+	_, files := testRemoteSnapshotLintProject(t, false, map[string]string{
+		"caller.yaml": caller,
+	})
+
+	var dbg testSyncWriter
+	opts := LinterOptions{Debug: true, LogWriter: &dbg}
+	linter, err := NewLinter(io.Discard, &opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs, err := linter.LintFiles(files, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(errs) != 0 {
+		t.Fatal("unexpected errors:", errs)
+	}
+
+	// The snapshot must be read and parsed only once even though the two caller jobs and the
+	// multiple rules look up the metadata of the same remote workflow
+	n := strings.Count(dbg.String(), "New reusable workflow metadata from snapshot")
+	if n != 1 {
+		t.Fatalf("snapshot was read %d times. debug output:\n%s", n, dbg.String())
+	}
+}
+
+func TestReusableWorkflowRemoteSnapshotLintLocalCallMessageUnchanged(t *testing.T) {
+	// A local reusable workflow call and a remote reusable workflow call with a snapshot can
+	// exist in the same workflow file. The error message for the local call must not mention
+	// the snapshot.
+	local := `
+on:
+  workflow_call:
+    inputs:
+      local-input:
+        type: string
+        required: true
+
+jobs:
+  job:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+`
+	caller := `
+on: push
+
+jobs:
+  local:
+    uses: ./.github/workflows/local.yml
+  remote:
+    uses: octo-org/shared-workflows/.github/workflows/build.yml@v1
+`
+	root, files := testRemoteSnapshotLintProject(t, false, map[string]string{
+		"caller.yaml": caller,
+		"local.yml":   local,
+	})
+	_ = root
+
+	linter, err := NewLinter(io.Discard, &LinterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs, err := linter.LintFiles(files, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var localErrs, remoteErrs []*Error
+	for _, err := range errs {
+		if strings.Contains(err.Message, `"local-input"`) {
+			localErrs = append(localErrs, err)
+		}
+		if strings.Contains(err.Message, `"version"`) || strings.Contains(err.Message, `"token"`) {
+			remoteErrs = append(remoteErrs, err)
+		}
+	}
+
+	if len(localErrs) != 1 {
+		t.Fatalf("wanted 1 error for the local call but got %d: %v", len(localErrs), errs)
+	}
+	want := `input "local-input" is required by "./.github/workflows/local.yml" reusable workflow`
+	if msg := localErrs[0].Error(); !strings.Contains(msg, want) {
+		t.Fatalf("error %q does not contain %q", msg, want)
+	}
+	if msg := localErrs[0].Error(); strings.Contains(msg, "snapshot") {
+		t.Fatalf("error message for a local call must not mention snapshots: %q", msg)
+	}
+
+	// The remote call misses the required input "version" and the required secret "token".
+	// Both errors must mention the snapshot.
+	if len(remoteErrs) != 2 {
+		t.Fatalf("wanted 2 errors for the remote call but got %d: %v", len(remoteErrs), errs)
+	}
+	for _, err := range remoteErrs {
+		if msg := err.Error(); !strings.Contains(msg, `. the metadata was read from snapshot "`) {
+			t.Fatalf("error message for a remote call must mention the snapshot: %q", msg)
+		}
 	}
 }

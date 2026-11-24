@@ -540,6 +540,10 @@ func (l *Linter) check(
 	}
 	if cfg != nil {
 		l.debug("Config: %#v", cfg)
+		// Let the reusable workflows cache know the effective config so that it can resolve
+		// snapshots of remote reusable workflow files. Note that the config is the same for
+		// all files in the same project so setting it multiple times is not a problem.
+		localReusableWorkflows.SetConfig(cfg)
 	} else {
 		l.debug("No config was found")
 	}
